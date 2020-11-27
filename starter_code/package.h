@@ -6,16 +6,17 @@
 #include <sys/types.h>
 
 #define UDP_SIZE 1500
+#define CHUNK_SIZE 74
 
 typedef struct header_s
 {
-    uint16_t magicnum;
-    uint8_t version;
-    uint8_t packet_type;
-    uint8_t header_len;
-    uint8_t packet_len;
-    uint32_t seq_num;
-    uint32_t ack_num;
+  short magicnum;
+  char version;
+  char packet_type;
+  short header_len;
+  short packet_len; 
+  u_int seq_num;
+  u_int ack_num;
 } header_t;
 
 typedef struct data_body_s
@@ -37,9 +38,9 @@ typedef struct data_body_s
 typedef struct WHOHAS_pack_s
 {
     header_t header;
-    uint8_t chunk_num;
-    uint8_t padding[3];
-    char chunks[UDP_SIZE - 20];
+    char chunk_num;
+    char padding[3];
+    uint8_t chunks[74][20];
 } WHOHAS_pack_t, IHAVE_pack_t;
 
 // typedef struct WHOHAS_pack_s

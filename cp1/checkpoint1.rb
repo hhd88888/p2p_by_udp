@@ -118,9 +118,9 @@ end
 
 
 # comment out these 3 lines, once you've read the README
-puts "Make sure you carefully read the README!"
-puts "Then comment these lines out.  Exiting..."
-exit 0
+# puts "Make sure you carefully read the README!"
+# puts "Then comment these lines out.  Exiting..."
+# exit 0
 
 if (!File.exists?("peer"))
 	puts "Error: need to have binary named 'peer' in this directory"

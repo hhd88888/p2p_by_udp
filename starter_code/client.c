@@ -5,6 +5,7 @@
 #include <netinet/in.h>
 #include <stdio.h>
 #include <arpa/inet.h>
+#include "spiffy.h"
 
 #define PACKETLEN 1500
 #define BUFLEN 100
