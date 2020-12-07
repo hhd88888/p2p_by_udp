@@ -6,7 +6,6 @@
 #include <sys/types.h>
 
 #define UDP_SIZE 1500
-#define CHUNK_SIZE 74
 
 typedef struct header_s
 {
@@ -15,14 +14,14 @@ typedef struct header_s
   char packet_type;
   short header_len;
   short packet_len; 
-  u_int seq_num;
-  u_int ack_num;
+  unsigned int seq_num;
+  unsigned int ack_num;
 } header_t;
 
 typedef struct data_body_s
 {
     header_t header;
-    uint8_t *data;
+    char data[1484];
 } ack_packet_t, data_packet_t;
 
 // typedef struct ack_pack_s
@@ -56,7 +55,7 @@ typedef struct WHOHAS_pack_s
 typedef struct get_pack_s
 {
     header_t header;
-    uint8_t *chunk;
+    char chunk[20];
 } get_pack_t;
 
 typedef struct denied_pack_s
@@ -64,5 +63,7 @@ typedef struct denied_pack_s
     header_t header;
     // something needed to be entered;
 } denied_pack_t;
+
+
 
 #endif

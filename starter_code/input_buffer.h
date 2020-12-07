@@ -14,5 +14,5 @@ struct user_iobuf {
 struct user_iobuf *create_userbuf();
 
 void process_user_input(int fd, struct user_iobuf *userbuf, 
-			void (*handle_line)(char *, void *, int, bt_config_t*), void *cbdata, int socket, bt_config_t *config);
+			void (*handle_line)(char *, void *, int, bt_config_t*), void *cbdata, int sock, bt_config_t *config);
 

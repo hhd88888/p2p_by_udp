@@ -1,4 +1,3 @@
 make
-cp peer ../cp1/peer
-cd ../cp1
-ruby checkpoint1.rb
+cp peer ../cp2/peer
+cd ../cp2
