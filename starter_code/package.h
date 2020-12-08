@@ -18,10 +18,10 @@ typedef struct header_s
   unsigned int ack_num;
 } header_t;
 
-typedef struct data_body_s
+typedef struct data_packet_s
 {
     header_t header;
-    char data[1484];
+    char data[1400];
 } ack_packet_t, data_packet_t;
 
 // typedef struct ack_pack_s
@@ -39,7 +39,7 @@ typedef struct WHOHAS_pack_s
     header_t header;
     char chunk_num;
     char padding[3];
-    uint8_t chunks[74][20];
+    char chunks[74][20];
 } WHOHAS_pack_t, IHAVE_pack_t;
 
 // typedef struct WHOHAS_pack_s

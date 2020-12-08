@@ -36,8 +36,9 @@
 
 #define RTT 1.0
 #define BUFLEN 1500
-#define DATA_SIZE 1486
+#define DATA_SIZE 1400
 #define MAX_JUMPS 3
+#define SLIDE_WINDOW 1
 
 static jmp_buf jump_buf; // use to store retransmit state of different connection
 static int con_num = 0;
@@ -142,7 +143,7 @@ void sig_alarm(int signo)
     siglongjmp(jump_buf, 1);
 }
 
-void send_ack(int sock, unsigned int acknum, struct sockaddr_in recvfrom)
+void send_ack(int sock, unsigned int acknum, struct sockaddr_in from, socklen_t fromlen)
 {
     ack_packet_t ack_pack;
     ack_pack.header.magicnum = htons(15441);
@@ -150,9 +151,9 @@ void send_ack(int sock, unsigned int acknum, struct sockaddr_in recvfrom)
     ack_pack.header.packet_type = 4;
     ack_pack.header.packet_len = htons(16);
     ack_pack.header.header_len = htons(16);
-    ack_pack.header.ack_num = htons(acknum);
+    ack_pack.header.ack_num = htonl(acknum);
 
-    spiffy_sendto(sock, &ack_pack, sizeof(ack_packet_t), 0, (struct sockaddr *)&recvfrom, sizeof(recvfrom));
+    spiffy_sendto(sock, &ack_pack, sizeof(ack_packet_t), 0, (struct sockaddr *)&from, fromlen);
 }
 
 int completed(int id, char *outputfile, uint8_t *hash)
@@ -186,7 +187,7 @@ void reget(char *hash)
 
 void receive_and_send_ack(int sock, uint8_t *hash, int id, char *outputfile)
 {
-    FILE *fp = fopen(outputfile, "w");
+    FILE *fp = fopen(outputfile, "r+");
     if (fseek(fp, BT_CHUNK_SIZE * id, SEEK_SET))
     {
         perror("can't set the file pointer");
@@ -195,50 +196,61 @@ void receive_and_send_ack(int sock, uint8_t *hash, int id, char *outputfile)
 
     unsigned int next_pack_expected = 1;
     unsigned int last_pack_rcvd = 0;
-    data_packet_t data_pack;
+    data_packet_t *data_pack;
+    //fseek(fp, id * BT_CHUNK_SIZE, SEEK_SET);
+    char buf[BUFLEN];
+
+    int retval;
 
     struct sockaddr_in from;
-    while (!completed(id, outputfile, hash))
+    socklen_t fromlen = sizeof(from);
+    while ((int)ftell(fp) < (id + 1) * BT_CHUNK_SIZE)
     {
-        //alarm(75);
-        spiffy_recvfrom(sock, &data_pack, sizeof(data_packet_t), 0, (struct sockaddr *)&from, (socklen_t)sizeof(from));
-        //alarm(0);
-        if (ntohs(data_pack.header.seq_num) == next_pack_expected)
+        retval = spiffy_recvfrom(sock, buf, BUFLEN, MSG_DONTWAIT, (struct sockaddr *)&from, &fromlen);
+        if (retval > 0)
         {
-            fwrite(&(data_pack.data), sizeof(char), sizeof(data_pack.data), fp);
-            next_pack_expected++;
+            data_pack = (data_packet_t *)buf;
+            if (data_pack->header.packet_type == 3)
+            {
+                if ((ntohl(data_pack->header.seq_num)) == next_pack_expected)
+                {
+                    size_t size = ntohs(data_pack->header.packet_len) - 16;
+                    int n = fwrite(data_pack->data, sizeof(char), size, fp);
+                    next_pack_expected++;
+                }
+                send_ack(sock, next_pack_expected - 1, from, fromlen);
+            }
         }
-        send_ack(sock, next_pack_expected - 1, from);
     }
     fclose(fp);
 }
 
-void get(char *hash, struct sockaddr_in from, int port, int id, char *outputfile)
+void get(char *hash, struct sockaddr_in from, int sock, int id, char *outputfile)
 {
     //new sock;
-    printf("---------------------1\n");
-    int sock;
-    struct sockaddr_in myaddr;
+    //printf("---------------------id:%d_________________________-————————————————————————————————\n", id);
+    // int sock;
+    // struct sockaddr_in myaddr;
 
-    if ((sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP)) == -1)
-    {
-        perror("get could not create socket");
-        exit(-1);
-    }
+    // if ((sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP)) == -1)
+    // {
+    //     perror("get could not create socket");
+    //     exit(-1);
+    // }
 
-    bzero(&myaddr, sizeof(myaddr));
-    myaddr.sin_family = AF_INET;
-    myaddr.sin_addr.s_addr = htonl(INADDR_ANY);
-    myaddr.sin_port = htons(port);
+    // bzero(&myaddr, sizeof(myaddr));
+    // myaddr.sin_family = AF_INET;
+    // myaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    // myaddr.sin_port = htons(port);
 
-    if (bind(sock, (struct sockaddr *)&myaddr, sizeof(myaddr)) == -1)
-    {
-        perror("get could not bind socket");
-        exit(-1);
-    }
+    // if (bind(sock, (struct sockaddr *)&myaddr, sizeof(myaddr)) == -1)
+    // {
+    //     perror("get could not bind socket");
+    //     exit(-1);
+    // }
 
-    signal(SIGALRM, sig_alarm);
     struct sockaddr_in recv_from;
+
     get_pack_t get_pack;
 
     // make get_pack
@@ -249,20 +261,12 @@ void get(char *hash, struct sockaddr_in from, int port, int id, char *outputfile
 
     memcpy(get_pack.chunk, hash, 20);
     get_pack.header.packet_len = htons(36);
-    char buf[BUFLEN];
-sendagain:
-    spiffy_sendto(sock, &get_pack, sizeof(get_pack_t), 0, (struct sockaddr *)&recv_from, (socklen_t)sizeof(recv_from));
+
+    spiffy_sendto(sock, &get_pack, sizeof(get_pack_t), 0, (struct sockaddr *)&from, (socklen_t)sizeof(from));
 
     // user alarm to transmit and go to receive function after receive
-    alarm(RTT);
 
-    if (sigsetjmp(jump_buf, 1) != 0)
-    {
-        goto sendagain;
-    }
-
-    spiffy_recvfrom(sock, buf, BUFLEN, 0, (struct sockaddr *)&recv_from, sizeof(recv_from));
-    alarm(0);
+    //spiffy_recvfrom(sock, buf, BUFLEN, 0, (struct sockaddr *)&recv_from, sizeof(recv_from));
 
     // receive the first pack and this means cennection is constructed
     receive_and_send_ack(sock, hash, id, outputfile);
@@ -271,12 +275,12 @@ sendagain:
 unsigned int send_all_data_pack(int sock, struct sockaddr_in from, unsigned int LastPacketAcked, unsigned int LastPacketAvailable, int data_num, uint8_t *buffer)
 {
     unsigned int LastPacketSent = 0;
-    int max_seq = ceil((double)data_num / DATA_SIZE);
+    int max_seq = (int)ceil((double)data_num / DATA_SIZE);
+    LastPacketSent = max_seq < LastPacketAvailable ? max_seq : LastPacketAvailable;
     for (unsigned int i = LastPacketAcked + 1; i <= LastPacketSent; i++)
     {
-        LastPacketSent = max_seq < LastPacketAvailable ? max_seq : LastPacketAcked;
         int data_size = DATA_SIZE;
-        if (i == ceil((double)data_num / DATA_SIZE))
+        if (i == max_seq)
         {
             data_size = data_num - DATA_SIZE * (i - 1);
         }
@@ -285,9 +289,8 @@ unsigned int send_all_data_pack(int sock, struct sockaddr_in from, unsigned int 
         data_pack.header.version = 1;
         data_pack.header.packet_type = 3;
         data_pack.header.header_len = htons(16);
-        data_pack.header.seq_num = htons(i);
+        data_pack.header.seq_num = htonl(i);
         data_pack.header.packet_len = htons(16 + data_size);
-
         memcpy(data_pack.data, buffer + (i - 1) * DATA_SIZE, data_size);
         spiffy_sendto(sock, &data_pack, sizeof(data_packet_t), 0, (struct sockaddr *)&from, (socklen_t)sizeof(from));
     }
@@ -298,58 +301,65 @@ void send_data_pack(int id, char *datafile, int sock, struct sockaddr_in from)
 {
     FILE *fp = fopen(datafile, "r");
     fseek(fp, id * BT_CHUNK_SIZE, SEEK_SET);
-    uint8_t buffer[BT_CHUNK_SIZE];
+    char buffer[BT_CHUNK_SIZE];
     int data_num = fread(buffer, sizeof(uint8_t), BT_CHUNK_SIZE, fp);
     unsigned int LastPacketAcked = 0;
     unsigned int LastPacketSent = 0;
-    unsigned int LastPacketAvailable = 8;
+    unsigned int LastPacketAvailable = LastPacketAcked + SLIDE_WINDOW;
     int duplicate_ack = 0;
-    ack_packet_t ack_pack;
+    ack_packet_t *ack_pack;
+    char buf[BUFLEN];
+    int retval;
 
-    while (LastPacketAcked < ceil((double)data_num / DATA_SIZE))
+    struct sockaddr_in recvfrom;
+    socklen_t recvformlen = sizeof(recvfrom);
+
+    int max_seq = (int)ceil((double)data_num / DATA_SIZE);
+
+    while (LastPacketAcked < max_seq)
     {
-        signal(SIGALRM, sig_alarm);
-    sendAgain:
         LastPacketSent = send_all_data_pack(sock, from, LastPacketAcked, LastPacketAvailable, data_num, buffer);
-        alarm(RTT);
-        if (sigsetjmp(jump_buf, 1) != 0)
+        retval = spiffy_recvfrom(sock, buf, BUFLEN, MSG_DONTWAIT, (struct sockaddr *)&recvfrom, &recvformlen);
+        if (retval > 0)
         {
-            goto sendAgain;
-        }
-        spiffy_recvfrom(sock, &ack_pack, sizeof(ack_packet_t), 0, (struct sockaddr *)&from, (socklen_t)sizeof(from));
-        alarm(0);
-        if (ntohs(ack_pack.header.ack_num) == LastPacketAcked)
-        {
-            duplicate_ack++;
-        }
-        else if (LastPacketAcked < ack_pack.header.ack_num)
-        {
-            duplicate_ack = 0;
-            LastPacketAcked = ack_pack.header.ack_num;
-            LastPacketAvailable = LastPacketSent + 8;
-        }
+            if (buf[3] == 4)
+            {
+                ack_pack = (ack_packet_t *)buf;
 
-        if (duplicate_ack == 3)
-        {
-            goto sendAgain;
+                if (ntohl(ack_pack->header.ack_num) == LastPacketAcked)
+                {
+                    duplicate_ack++;
+                }
+                else if (LastPacketAcked < ntohl(ack_pack->header.ack_num))
+                {
+                    duplicate_ack = 0;
+                    LastPacketAcked = ntohl(ack_pack->header.ack_num);
+                    LastPacketAvailable = LastPacketSent + SLIDE_WINDOW;
+                }
+
+                if (duplicate_ack == 3)
+                {
+                }
+            }
         }
     }
+    fclose(fp);
 }
 
 void send_data(int sock, struct sockaddr_in from, bt_config_t *config, get_pack_t *get_pack)
 {
     FILE *fp = fopen(config->chunk_file, "r");
-    char *datafile;
-    fscanf("File: %s\n", datafile);
+    char datafile[128];
+    fscanf(fp, "File: %s\n", datafile);
 
     int id;
-    char *ascii_hash;
-    char hash[20];
+    char ascii_hash[2 * SHA1_HASH_SIZE + 1];
+    char recv_hash[2 * SHA1_HASH_SIZE + 1];
     fscanf(fp, "Chunks:\n");
+    hex2ascii(get_pack->chunk, SHA1_HASH_SIZE, recv_hash);
     while (fscanf(fp, "%d %s\n", &id, ascii_hash) != EOF)
     {
-        ascii2hex(ascii_hash, strlen(ascii_hash), hash);
-        if (hash == get_pack->chunk)
+        if (strcmp(recv_hash, ascii_hash) == 0)
         {
             send_data_pack(id, datafile, sock, from);
             break;
@@ -371,10 +381,10 @@ void process_inbound_udp(int sock, bt_config_t *config)
     //recvfrom(sock, buf, BUFLEN, 0, (struct sockaddr *)&from, &fromlen);
 
     printf("PROCESS_INBOUND_UDP SKELETON -- replace!\n"
-           "Incoming message from %s:%d\n%s\n\n",
+           "Incoming message from %s:%d\n%d\n\n",
            inet_ntoa(from.sin_addr),
            ntohs(from.sin_port),
-           buf);
+           buf[3]);
 
     switch (buf[3])
     {
@@ -386,9 +396,10 @@ void process_inbound_udp(int sock, bt_config_t *config)
         send_IHAVE_pack(sock, from, config, curr);
         break;
     }
-    case 3:
+    case 2:
     {
         get_pack_t *curr;
+        curr = (get_pack_t *)buf;
         send_data(sock, from, config, curr);
     }
     // case 1:
@@ -466,106 +477,128 @@ static void intermit(int signo)
 void process_get(char *chunkfile, char *outputfile, bt_config_t *config, int sock)
 {
     printf("PROCESS GET SKELETON CODE CALLED yes.  Fill me in!  (%s, %s)\n",
-            chunkfile, outputfile);
+           chunkfile, outputfile);
     // todo
     bzero(chunkfileName, sizeof(chunkfileName));
     bzero(outputfileName, sizeof(outputfileName));
     strcpy(chunkfileName, chunkfile);
     strcpy(outputfileName, outputfile);
-    int chunk_num = send_WHOHAS_request(chunkfile, sock, config);
-    // struct sockaddr_in from;
-    // socklen_t fromlen;
-    // WHOHAS_pack_t *curr;
+    int packet_num = send_WHOHAS_request(chunkfile, sock, config);
+    int chunk_num;
+    struct sockaddr_in from;
+    struct sockaddr_in recv_from;
+    socklen_t fromlen;
+    socklen_t recv_from_len;
+    WHOHAS_pack_t *curr;
 
-    // fromlen = sizeof(from);
+    fromlen = sizeof(from);
+    recv_from_len = sizeof(recv_from);
 
-    // struct hash_peer_t hash_peer[50];
-    // for (int i = 0; i < 50; i++)
-    // {
-    //     hash_peer[i].chunk_num = 0;
-    // }
-    // int peer_index = 0;
-    // int flag = 0;
+    struct hash_peer_t hash_peer[50];
+    for (int i = 0; i < 50; i++)
+    {
+        hash_peer[i].chunk_num = 0;
+    }
+    int peer_index = 0;
+    int flag = 0;
 
-    // //use 5 seconds to collect have_pack;
-    // time_t start = time(NULL);
-    // time_t now;
+    //use 5 seconds to collect have_pack;
+    time_t start = time(NULL);
+    time_t now;
 
-    // char buf[BUFLEN];
-    // int n;
+    char buf[BUFLEN];
+    int n;
+    int i, j;
 
-    // while (difftime(now, start) <= 5.0)
-    // {
-    //     n = recvfrom(socket_new, buf, BUFLEN, MSG_DONTWAIT, (struct sockaddr *)&from, &fromlen);
-    //     if (n > 0)
-    //     {
-    //         printf("-------------%d----------\n", buf[3]);
-    //         switch (buf[3])
-    //         {
-    //         case 1:
-    //         {
-    //             // collect have_pack and try to arrange the peer;
-    //             printf("---------------------4\n");
-    //             IHAVE_pack_t *curr;
-    //             curr = (IHAVE_pack_t *)buf;
-    //             for (int i = 0; i < peer_index; i++)
-    //             {
-    //                 if (ntohs(hash_peer[i].from.sin_port) == ntohs(from.sin_port) && (inet_ntoa(hash_peer[i].from.sin_addr) == inet_ntoa(from.sin_addr)))
-    //                 {
-    //                     flag = 1;
-    //                     for (int j = 0; j < curr->chunk_num; j++)
-    //                     {
-    //                         memcpy(hash_peer[i].chunks[hash_peer[i].chunk_num], curr->chunks[j], 20);
-    //                         hash_peer[i].chunk_num++;
-    //                     }
-    //                     break;
-    //                 }
-    //             }
-    //             if (!flag)
-    //             {
-    //                 for (int i = 0; i < curr->chunk_num; i++)
-    //                 {
-    //                     memcpy(hash_peer[peer_index].chunks[0], curr->chunks[i], 20);
-    //                     hash_peer[peer_index].chunk_num++;
-    //                 }
-    //             }
-    //             break;
-    //         }
-    //         default:
-    //             break;
-    //         }
-    //     }
+    while (difftime(now, start) <= 5.0)
+    {
+        n = spiffy_recvfrom(sock, buf, BUFLEN, MSG_DONTWAIT, (struct sockaddr *)&from, &fromlen);
+        //printf("***&*&^*&^*^*^\n");
+        if (n > 0)
+        {
+            IHAVE_pack_t *curr;
+            curr = (IHAVE_pack_t *)buf;
+            switch (curr->header.packet_type)
+            {
+            case 1:
+            {
+                chunk_num = curr->chunk_num;
+                // collect have_pack and try to arrange the peer;
+                // for (i = 0; i < peer_index; i++)
+                // {
+                //     if (ntohs(hash_peer[i].from.sin_port) == ntohs(from.sin_port) && (inet_ntoa(hash_peer[i].from.sin_addr) == inet_ntoa(from.sin_addr)))
+                //     {
+                //         flag = 1;
+                //         for (j = 0; j < chunk_num; j++)
+                //         {
+                //             memcpy(hash_peer[i].chunks[hash_peer[i].chunk_num], curr->chunks[j], 20);
+                //             hash_peer[i].chunk_num++;
+                //         }
+                //         break;
+                //     }
+                // }
+                // if (!flag)
+                // {
+                //     printf("hash:%d\n", chunk_num);
+                //     for (i = 0; i < chunk_num; i++)
+                //     {
+                //         printf("%d************", chunk_num);
+                //         char result[2*SHA1_HASH_SIZE+1];
+                //         hex2ascii(curr->chunks[i], SHA1_HASH_SIZE, result);
+                //         printf("hash:%s\n", result);
+                //         memcpy(hash_peer[peer_index].chunks[0], curr->chunks[i], 20);
+                //         hash_peer[peer_index].chunk_num++;
+                //     }
+                //     printf("***&*&^*&^*^*^sdadwd\n");
+                // }
+                // break;
 
-    //     now = time(NULL);
-    //     flag = 0;
-    // }
+                // we need to add address
+                recv_from_len = fromlen;
+                recv_from = from;
 
-    // //construct plain file
-    // FILE *output = fopen(outputfile, "w");
-    // char output_buf[BT_CHUNK_SIZE * chunk_num];
-    // fwrite(output_buf, BT_CHUNK_SIZE, chunk_num, output);
-    // fclose(output);
+                // for (i = 0; i < chunk_num; i++)
+                // {
+                //     printf("%d************", buf[16]);
+                //     char result[2*SHA1_HASH_SIZE+1];
+                //     hex2ascii(curr->chunks[i], SHA1_HASH_SIZE, result);
+                //     printf("hash:%s\n", result);
+                // }
+            }
+            default:
+                break;
+            }
+        }
 
-    // // need to repair
-    // FILE *fp = fopen(chunkfile, "r");
-    // assert(fp != NULL);
+        now = time(NULL);
+    }
 
-    // int cur = 0;
+    FILE *out_put = fopen(outputfile, "w");
+    char output_buf[BT_CHUNK_SIZE * chunk_num];
+    memset(output_buf, 1, BT_CHUNK_SIZE * chunk_num);
+    fwrite(output_buf, sizeof(char), BT_CHUNK_SIZE * chunk_num, out_put);
+    fclose(out_put);
 
-    // int id;
-    // char chunk_hash[100];
-    // char hash[20];
+    // need to repair
+    FILE *fp = fopen(chunkfile, "r");
+    assert(fp != NULL);
 
-    // //to use and check
+    int cur = 0;
 
-    // while (fscanf(fp, "%d %s\n", &id, chunk_hash) != EOF)
-    // {
-    //     ascii2hex(chunk_hash, strlen(chunk_hash), hash);
-    //     get(hash, from, config->myport, id, outputfile);
-    // }
+    int id;
+    char chunk_hash[100];
+    char hash[20];
+
+    //to use and check
+
+    while (fscanf(fp, "%d %s\n", &id, chunk_hash) != EOF)
+    {
+        ascii2hex(chunk_hash, strlen(chunk_hash), hash);
+        get(hash, recv_from, sock, id, outputfile);
+    }
 }
 
-void handle_user_input(char *line, void *cbdata, int sock,bt_config_t *config)
+void handle_user_input(char *line, void *cbdata, int sock, bt_config_t *config)
 {
     char chunkf[128], outf[128];
 
@@ -576,7 +609,7 @@ void handle_user_input(char *line, void *cbdata, int sock,bt_config_t *config)
     {
         if (strlen(outf) > 0)
         {
-            process_get(chunkf, outf,config, sock);
+            process_get(chunkf, outf, config, sock);
         }
     }
 }
