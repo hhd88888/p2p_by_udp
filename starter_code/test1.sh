@@ -1,3 +1,2 @@
 make
-cp peer ../cp2/peer
-cd ../cp2
+cp peer ../cp3/peer

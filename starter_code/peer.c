@@ -38,7 +38,7 @@
 #define BUFLEN 1500
 #define DATA_SIZE 1400
 #define MAX_JUMPS 3
-#define SLIDE_WINDOW 1
+#define SLIDE_WINDOW 8
 
 static jmp_buf jump_buf; // use to store retransmit state of different connection
 static int con_num = 0;
@@ -262,11 +262,31 @@ void get(char *hash, struct sockaddr_in from, int sock, int id, char *outputfile
     memcpy(get_pack.chunk, hash, 20);
     get_pack.header.packet_len = htons(36);
 
+    socklen_t recv_fromlen = sizeof(recv_from);
+    int retval;
+    char buf[BUFLEN];
+    clock_t start = clock();
+    clock_t now;
     spiffy_sendto(sock, &get_pack, sizeof(get_pack_t), 0, (struct sockaddr *)&from, (socklen_t)sizeof(from));
+    while (1)
+    {
+        now = clock();
+        if ((now - start) / CLOCKS_PER_SEC >= RTT)
+        {
+            spiffy_sendto(sock, &get_pack, sizeof(get_pack_t), 0, (struct sockaddr *)&from, (socklen_t)sizeof(from));
+            start = clock();
+        }
 
-    // user alarm to transmit and go to receive function after receive
+        retval = spiffy_recvfrom(sock, buf, BUFLEN, 0, (struct sockaddr *)&recv_from, &recv_fromlen);
+        if (retval)
+        {
+            if (buf[3] == 3)
+            {
+                break;
+            }
+        }
 
-    //spiffy_recvfrom(sock, buf, BUFLEN, 0, (struct sockaddr *)&recv_from, sizeof(recv_from));
+    }
 
     // receive the first pack and this means cennection is constructed
     receive_and_send_ack(sock, hash, id, outputfile);
@@ -316,9 +336,18 @@ void send_data_pack(int id, char *datafile, int sock, struct sockaddr_in from)
 
     int max_seq = (int)ceil((double)data_num / DATA_SIZE);
 
+    clock_t start = clock();
+    clock_t now;
+
+    LastPacketSent = send_all_data_pack(sock, from, LastPacketAcked, LastPacketAvailable, data_num, buffer);
+
     while (LastPacketAcked < max_seq)
     {
-        LastPacketSent = send_all_data_pack(sock, from, LastPacketAcked, LastPacketAvailable, data_num, buffer);
+        now = clock();
+        if ((now - start) / CLOCKS_PER_SEC >= RTT){
+            LastPacketSent = send_all_data_pack(sock, from, LastPacketAcked, LastPacketAvailable, data_num, buffer);
+            start = clock();
+        }
         retval = spiffy_recvfrom(sock, buf, BUFLEN, MSG_DONTWAIT, (struct sockaddr *)&recvfrom, &recvformlen);
         if (retval > 0)
         {
@@ -402,7 +431,7 @@ void process_inbound_udp(int sock, bt_config_t *config)
         curr = (get_pack_t *)buf;
         send_data(sock, from, config, curr);
     }
-    // case 1:
+    // case 1:d
     //     // need to arrange the prot num for different processing
     //     IHAVE_pack_t *curr;
     //     curr = (IHAVE_pack_t *)buf;
