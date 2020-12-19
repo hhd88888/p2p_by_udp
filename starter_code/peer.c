@@ -34,11 +34,11 @@
 #include "sha.h"
 #include <errno.h>
 
-#define RTT 1.0
+// #define RTT 0.2
 #define BUFLEN 1500
 #define DATA_SIZE 1400
-#define MAX_JUMPS 3
 #define SLIDE_WINDOW 8
+#define COLLAPSE_TIME 60 //peer is considered collapsed if not receive information for 60s
 
 void peer_run(bt_config_t *config);
 
@@ -74,19 +74,19 @@ struct chunk_peer_pair_t
     struct sockaddr_in peers[30];
     int index; // index of peers
     int id;
-    int completed;
+    int completed; // 0 no connection,1 completed, 2 receive but not completed;
 };
 
 struct peer_t
 {
     struct sockaddr_in from;
-    int state; // state = 0 no connection state = 1 connected state = 2 collapse
+    int state; // state = 0 no connection, state = 1 connected
     clock_t timer;
     int duplicate;
     char chunk[20];
     int id;
-    int type;                // type 0 receive, type 1 send
-    long offset;             //use to record the offset of file pointer;
+    int type;                        // type 0 receive, type 1 send
+    long offset;                     //use to record the offset of file pointer;
     unsigned int next_pack_expected; // type = 0 and decide the ack num
     unsigned int LastPacketAcked;
     unsigned int LastPacketSent;
@@ -109,6 +109,7 @@ char chunkfileName[128];
 static char g_outputfile[128];
 static char g_chunkfile[128];
 static char g_datafile[128];
+static double RTT = 0;
 
 int comp(char *str, WHOHAS_pack_t *curr)
 {
@@ -195,7 +196,6 @@ int completed(int id, char *outputfile, uint8_t *hash)
     shahash(buffer, numbytes, file_hash);
     hex2ascii(hash, SHA1_HASH_SIZE, ascii1);
     hex2ascii(file_hash, SHA1_HASH_SIZE, ascii2);
-    printf("chunk_hash:%s,%s\n", ascii1, ascii2);
 
     if (strcmp(file_hash, hash) == 0)
     {
@@ -205,12 +205,7 @@ int completed(int id, char *outputfile, uint8_t *hash)
     return 0;
 }
 
-void reget(char *hash)
-{
-    // todo
-}
-
-int receive_and_send_ack(int sock, struct peer_t* connection, char *outputfile, data_packet_t *curr)
+int receive_and_send_ack(int sock, struct peer_t *connection, char *outputfile, data_packet_t *curr)
 {
     FILE *fp = fopen(outputfile, "r+");
     if (fseek(fp, connection->offset, SEEK_SET))
@@ -218,34 +213,24 @@ int receive_and_send_ack(int sock, struct peer_t* connection, char *outputfile, 
         perror("can't set the file pointer");
     }
 
-    // unsigned int next_pack_expected = 1;
-    // unsigned int last_pack_rcvd = 0;
-    //fseek(fp, id * BT_CHUNK_SIZE, SEEK_SET);
-
-    int retval;
-
     socklen_t fromlen = sizeof(struct sockaddr_in);
     if (curr->header.packet_type == 3)
     {
         if ((ntohl(curr->header.seq_num)) == connection->next_pack_expected)
         {
-            //printf("%d-------------------------------\n", (int)ftell(fp));
             size_t size = ntohs(curr->header.packet_len) - 16;
             int n = fwrite(curr->data, sizeof(char), size, fp);
             connection->next_pack_expected++;
             connection->offset = (int)ftell(fp);
-            //printf("%d-------------------------------\n", n);
         }
         send_ack(sock, connection->next_pack_expected - 1, connection->from, fromlen);
     }
-
-    if ((int)ftell(fp) == (connection->id + 1) * BT_CHUNK_SIZE)
+    fclose(fp);
+    if (connection->offset == (connection->id + 1) * BT_CHUNK_SIZE)
     {
-        printf("%d-------------------------------\n", connection->id);
-        printf("%d-------------------------------\n", completed(connection->id, outputfile, connection->chunk));
+        completed(connection->id, g_outputfile, connection->chunk);
         return 1;
     }
-    fclose(fp);
     return 0;
 }
 
@@ -254,6 +239,8 @@ int get(char *hash, struct sockaddr_in from, int sock, int id, char *outputfile)
     struct sockaddr_in recv_from;
 
     get_pack_t get_pack;
+
+    int flag = 0; // if denied
 
     // make get_pack
     get_pack.header.magicnum = htons(15441);
@@ -269,14 +256,21 @@ int get(char *hash, struct sockaddr_in from, int sock, int id, char *outputfile)
     char buf[BUFLEN];
     clock_t start = clock();
     clock_t now;
-    spiffy_sendto(sock, &get_pack, sizeof(get_pack_t), 0, (struct sockaddr *)&from, (socklen_t)sizeof(from));
+    int retans_num = 0;
+    spiffy_sendto(sock, &get_pack, sizeof(get_pack_t), 0, (struct sockaddr *)&from, sizeof(from));
     while (1)
     {
         now = clock();
-        if ((now - start) / CLOCKS_PER_SEC >= RTT)
+        if ((now - start) / CLOCKS_PER_SEC >= 1)
         {
+            retans_num++;
             spiffy_sendto(sock, &get_pack, sizeof(get_pack_t), 0, (struct sockaddr *)&from, (socklen_t)sizeof(from));
             start = clock();
+        }
+        if (retans_num > 3)
+        {
+            // retansimit get_pack for more than 3 times, than think peer is collapsed
+            return 0;
         }
 
         retval = spiffy_recvfrom(sock, buf, BUFLEN, MSG_DONTWAIT, (struct sockaddr *)&recv_from, &recv_fromlen);
@@ -286,26 +280,36 @@ int get(char *hash, struct sockaddr_in from, int sock, int id, char *outputfile)
             {
                 break;
             }
+            else if (buf[3] == 5)
+            {
+                flag = 1;
+            }
         }
     }
+    now = clock();
+    RTT = RTT > (double)(now - start) / CLOCKS_PER_SEC ? RTT:  (now - start) / CLOCKS_PER_SEC;
 
-    for (int i = 0; i < max_connected; i++)
+    if (!flag)
     {
-        if (g_connection[i].state == 0)
+        for (int i = 0; i < max_connected; i++)
         {
-            bzero(&g_connection[i], sizeof(g_connection[i]));
-            g_connection[i].from = recv_from;
-            memcpy(g_connection[i].chunk, hash, 20);
-            g_connection[i].state = 1;
-            g_connection[i].id = id;
-            g_connection[i].timer = clock();
-            g_connection[i].type = 0;
-            g_connection[i].offset = id * BT_CHUNK_SIZE;
-            g_connection[i].next_pack_expected = 1;
-            break;
+            if (g_connection[i].state == 0)
+            {
+                bzero(&g_connection[i], sizeof(g_connection[i]));
+                g_connection[i].from = recv_from;
+                memcpy(g_connection[i].chunk, hash, 20);
+                g_connection[i].state = 1;
+                g_connection[i].id = id;
+                g_connection[i].timer = clock();
+                g_connection[i].type = 0;
+                g_connection[i].offset = id * BT_CHUNK_SIZE;
+                g_connection[i].next_pack_expected = 1;
+                break;
+            }
         }
+        return 1;
     }
-    return 1;
+    return 0;
 
     // receive the first pack and this means cennection is constructed
     // receive_and_send_ack(sock, hash, id, outputfile);
@@ -314,9 +318,7 @@ int get(char *hash, struct sockaddr_in from, int sock, int id, char *outputfile)
 unsigned int send_all_data_pack(int sock, struct peer_t *connection)
 {
     FILE *fp = fopen(g_datafile, "r");
-    fseek(fp, connection->offset, SEEK_SET);
     char buffer[BUFLEN];
-    fread(buffer, sizeof(char), BT_CHUNK_SIZE, fp);
     unsigned int LastPacketSent = 0;
     int max_seq = (int)ceil((double)BT_CHUNK_SIZE / DATA_SIZE);
     LastPacketSent = max_seq < connection->LastPacketAvailable ? max_seq : connection->LastPacketAvailable;
@@ -334,43 +336,31 @@ unsigned int send_all_data_pack(int sock, struct peer_t *connection)
         data_pack.header.header_len = htons(16);
         data_pack.header.seq_num = htonl(i);
         data_pack.header.packet_len = htons(16 + data_size);
-        memcpy(data_pack.data, buffer + (i - 1) * DATA_SIZE, data_size);
+        fseek(fp, connection->offset + (i - connection->LastPacketAcked - 1) * DATA_SIZE, SEEK_SET);
+        fread(buffer, sizeof(char), data_size, fp);
+        memcpy(data_pack.data, buffer, data_size);
         spiffy_sendto(sock, &data_pack, sizeof(data_packet_t), 0, (struct sockaddr *)&connection->from, (socklen_t)sizeof(connection->from));
     }
     return LastPacketSent;
     fclose(fp);
 }
 
-void send_data_pack(int sock,struct peer_t* connection)
+void send_data_pack(int sock, struct peer_t *connection)
 {
-    FILE *fp = fopen(g_datafile, "r");
-    fseek(fp, connection->offset, SEEK_SET);
-    char buffer[BT_CHUNK_SIZE];
-    int data_num = fread(buffer, sizeof(uint8_t), BT_CHUNK_SIZE, fp);
     connection->LastPacketAvailable = connection->LastPacketAcked + SLIDE_WINDOW;
     connection->LastPacketSent = send_all_data_pack(sock, connection);
-    //     retval = spiffy_recvfrom(sock, buf, BUFLEN, MSG_DONTWAIT, (struct sockaddr *)&recvfrom, &recvformlen);
-    //     if (retval > 0)
-    //     {
-    //         if (buf[3] == 4)
-    //         {
-    //             ack_pack = (ack_packet_t *)buf;
+    connection->timer = clock();
+}
 
-    //             if (ntohl(ack_pack->header.ack_num) == LastPacketAcked)
-    //             {
-    //                 duplicate_ack++;
-    //             }
-    //             else if (LastPacketAcked < ntohl(ack_pack->header.ack_num))
-    //             {
-    //                 duplicate_ack = 0;
-    //                 LastPacketAcked = ntohl(ack_pack->header.ack_num);
-    //                 LastPacketAvailable = LastPacketSent + SLIDE_WINDOW;
-    //             }
-
-    //         }
-    //     }
-    // }
-    fclose(fp);
+void send_denied_pack(int sock, struct sockaddr_in from)
+{
+    denied_pack_t denied_pack;
+    denied_pack.header.magicnum = htons(15441);
+    denied_pack.header.version = 1;
+    denied_pack.header.packet_type = 5;
+    denied_pack.header.header_len = htons(16);
+    denied_pack.header.packet_len = htons(16);
+    spiffy_sendto(sock, &denied_pack, sizeof(denied_pack_t), 0, (struct sockaddr *)&from, sizeof(from));
 }
 
 void send_data(int sock, struct sockaddr_in from, bt_config_t *config, get_pack_t *get_pack)
@@ -414,6 +404,34 @@ void send_data(int sock, struct sockaddr_in from, bt_config_t *config, get_pack_
     fclose(fp);
 }
 
+void build_new_connection(int sock)
+{
+    for (int i = 0; i < max_connected; i++)
+    {
+        if (g_connection[i].state != 1)
+        {
+            for (int j = 0; j < g_chunkNum; j++)
+            {
+                if (g_chunks[j].id == g_connection[i].id)
+                {
+                    g_chunks[j].completed = 1;
+                }
+                else if (g_chunks[j].completed == 0 && g_connected < max_connected)
+                {
+                    for (int k = 0; k < g_chunks[j].index; k++)
+                    {
+                        if ((!if_connected(g_chunks[j].peers[k])) && get(g_chunks[j].chunk, g_chunks[j].peers[k], sock, g_chunks[j].id, g_outputfile))
+                        {
+                            g_connected++;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 void process_inbound_udp(int sock, bt_config_t *config)
 {
     struct sockaddr_in from;
@@ -422,13 +440,10 @@ void process_inbound_udp(int sock, bt_config_t *config)
 
     fromlen = sizeof(from);
     spiffy_recvfrom(sock, buf, BUFLEN, 0, (struct sockaddr *)&from, &fromlen);
-    //recvfrom(sock, buf, BUFLEN, 0, (struct sockaddr *)&from, &fromlen);
-
-    //printf("PROCESS_INBOUND_UDP SKELETON -- replace!\n"
-        //    "Incoming message from %s:%d\n%d\n\n",
-        //    inet_ntoa(from.sin_addr),
-        //    ntohs(from.sin_port),
-        //    buf[3]);
+    printf("PROCESS_INBOUND_UDP SKELETON -- replace!\n"
+           "Incoming message from %s:%d\n\n\n",
+           inet_ntoa(from.sin_addr),
+           ntohs(from.sin_port));
 
     switch (buf[3])
     {
@@ -449,6 +464,11 @@ void process_inbound_udp(int sock, bt_config_t *config)
             send_data(sock, from, config, curr);
             g_connected++;
         }
+        else
+        {
+            send_denied_pack(sock, from);
+        }
+
         break;
     }
     case 3:
@@ -458,33 +478,13 @@ void process_inbound_udp(int sock, bt_config_t *config)
         curr = (data_packet_t *)buf;
         for (int i = 0; i < max_connected; i++)
         {
-            //printf("------------------%d------------%d\n", ntohl(g_connection[i].from.sin_addr.s_addr), ntohl(from.sin_addr.s_addr));
             if (g_connection[i].state == 1 && g_connection[i].type == 0 && ntohs(g_connection[i].from.sin_port) == ntohs(from.sin_port) && ntohl(g_connection[i].from.sin_addr.s_addr) == ntohl(from.sin_addr.s_addr))
             {
-                //printf("--------------------------%d\n", g_connection[i].id);
                 if (receive_and_send_ack(sock, &g_connection[i], g_outputfile, curr))
                 {
                     g_connection[i].state = 0; // if completed close connection get new chunk
                     g_connected--;
-                    for (int j = 0; j < g_chunkNum; j++)
-                    {
-                        if (g_chunks[j].id == g_connection[i].id)
-                        {
-                            g_chunks[j].completed = 1;
-                        }
-                        else if (g_chunks[j].completed == 0 && g_connected < max_connected)
-                        {
-                            for (int k = 0; k < g_chunks[j].index; k++)
-                            {
-                                if ((!if_connected(g_chunks[j].peers[k])) && get(g_chunks[j].chunk, g_chunks[j].peers[k], sock, g_chunks[j].id, g_outputfile))
-                                {
-                                    g_connected++;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    break;
+                    build_new_connection(sock);
                 }
             }
         }
@@ -496,25 +496,26 @@ void process_inbound_udp(int sock, bt_config_t *config)
         curr = (ack_packet_t *)buf;
         for (int i = 0; i < max_connected; i++)
         {
-            if (g_connection[i].state == 1 && g_connection[i].type == 0 && ntohs(g_connection[i].from.sin_port) == ntohs(from.sin_port) && ntohl(g_connection[i].from.sin_addr.s_addr) == ntohl(from.sin_addr.s_addr))
+            if (g_connection[i].state == 1 && g_connection[i].type == 1 && ntohs(g_connection[i].from.sin_port) == ntohs(from.sin_port) && ntohl(g_connection[i].from.sin_addr.s_addr) == ntohl(from.sin_addr.s_addr))
             {
-                if (g_connection[i].LastPacketAcked == ntohl(curr->header.seq_num))
+                if (g_connection[i].LastPacketAcked == ntohl(curr->header.ack_num))
                 {
                     g_connection[i].duplicate++;
                     if (g_connection[i].duplicate == 3)
                     {
-                        send_all_data_pack(sock, &g_connection[i]);
+                        send_data_pack(sock, &g_connection[i]);
                     }
                 }
                 else
                 {
-                    g_connection[i].LastPacketAcked = ntohl(curr->header.seq_num);
+                    g_connection[i].LastPacketAcked = ntohl(curr->header.ack_num);
                     g_connection[i].duplicate = 0;
                     g_connection[i].offset = BT_CHUNK_SIZE * g_connection[i].id + g_connection[i].LastPacketAcked * DATA_SIZE;
                 }
                 if (g_connection[i].LastPacketAcked == (int)ceil((double)BT_CHUNK_SIZE / DATA_SIZE)) // send all data
                 {
                     g_connection[i].state = 0;
+                    g_connected--;
                 }
             }
         }
@@ -592,33 +593,18 @@ int if_connected(struct sockaddr_in from)
     return 0;
 }
 
-void process_get(char *chunkfile, char *outputfile, bt_config_t *config, int sock)
+void receive_IHAVE_pack(int sock)
 {
-    printf("PROCESS GET SKELETON CODE CALLED yes.  Fill me in!  (%s, %s)\n",
-           chunkfile, outputfile);
-    // todo
-    strcpy(g_chunkfile, chunkfile);
-    strcpy(g_outputfile, outputfile);
-    send_WHOHAS_request(chunkfile, sock, config);
-    int chunk_num;
-    struct sockaddr_in from;
-    struct sockaddr_in recv_from;
-    socklen_t fromlen;
-    socklen_t recv_from_len;
-    WHOHAS_pack_t *curr;
-
-    fromlen = sizeof(from);
-    recv_from_len = sizeof(recv_from);
-    int peer_index = 0;
     int flag = 0;
-
+    char buf[BUFLEN];
+    int n;
+    int i, j, chunk_num;
+    struct sockaddr_in from;
+    socklen_t fromlen;
+    fromlen = sizeof(from);
     //use 5 seconds to collect have_pack;
     time_t start = time(NULL);
     time_t now = time(NULL);
-
-    char buf[BUFLEN];
-    int n;
-    int i, j;
     while (difftime(now, start) <= 5.0)
     {
         n = spiffy_recvfrom(sock, buf, BUFLEN, MSG_DONTWAIT, (struct sockaddr *)&from, &fromlen);
@@ -654,8 +640,11 @@ void process_get(char *chunkfile, char *outputfile, bt_config_t *config, int soc
                         memcpy(g_chunks[g_chunkNum].chunk, curr->chunks[i], SHA1_HASH_SIZE);
                         g_chunks[g_chunkNum].peers[g_chunks[g_chunkNum].index] = from;
                         g_chunks[g_chunkNum].index++;
-                        g_chunks[g_chunkNum].completed = 0;
-                        g_chunkNum++;
+                        if (g_chunks[g_chunkNum].completed != 1 && g_chunks[g_chunkNum].completed != 2)
+                        {
+                            g_chunks[g_chunkNum].completed = 0;
+                            g_chunkNum++;
+                        }
                     }
                     flag = 0;
                 }
@@ -666,11 +655,23 @@ void process_get(char *chunkfile, char *outputfile, bt_config_t *config, int soc
         }
         now = time(NULL);
     }
+}
+
+void process_get(char *chunkfile, char *outputfile, bt_config_t *config, int sock)
+{
+    printf("PROCESS GET SKELETON CODE CALLED yes.  Fill me in!  (%s, %s)\n",
+           chunkfile, outputfile);
+    // todo
+    strcpy(g_chunkfile, chunkfile);
+    strcpy(g_outputfile, outputfile);
+    send_WHOHAS_request(chunkfile, sock, config);
+
+    receive_IHAVE_pack(sock);
 
     FILE *out_put = fopen(outputfile, "w");
-    char output_buf[BT_CHUNK_SIZE * chunk_num];
-    memset(output_buf, 1, BT_CHUNK_SIZE * chunk_num);
-    fwrite(output_buf, sizeof(char), BT_CHUNK_SIZE * chunk_num, out_put);
+    char output_buf[BT_CHUNK_SIZE * g_chunkNum];
+    memset(output_buf, 1, BT_CHUNK_SIZE * g_chunkNum);
+    fwrite(output_buf, sizeof(char), BT_CHUNK_SIZE * g_chunkNum, out_put);
     fclose(out_put);
 
     FILE *fp = fopen(chunkfile, "r");
@@ -682,23 +683,23 @@ void process_get(char *chunkfile, char *outputfile, bt_config_t *config, int soc
     char chunk_hash[2 * SHA1_HASH_SIZE + 1];
     char hash[20];
 
-    //to use and check
+    //to use and Oprocsscheck
 
     while (fscanf(fp, "%d %s\n", &id, chunk_hash) != EOF && g_connected < max_connected)
     {
         ascii2hex(chunk_hash, strlen(chunk_hash), hash);
-        for (i = 0; i < g_chunkNum; i++)
+        for (int i = 0; i < g_chunkNum; i++)
         {
             char ascii_get_chunk[2 * SHA1_HASH_SIZE + 1];
             hex2ascii(g_chunks[i].chunk, SHA1_HASH_SIZE, ascii_get_chunk);
             if (strcmp(chunk_hash, ascii_get_chunk) == 0)
             {
                 g_chunks[i].id = id;
-                printf("%d----------------\n", g_chunks[i].id);
-                for (j = 0; j < g_chunks[i].index; j++)
+                for (int j = 0; j < g_chunks[i].index; j++)
                 {
                     if ((!if_connected(g_chunks[i].peers[j])) && get(hash, g_chunks[i].peers[j], sock, id, outputfile))
                     {
+                        g_chunks[i].completed = 2;
                         g_connected++;
                         break;
                     }
@@ -722,6 +723,12 @@ void handle_user_input(char *line, void *cbdata, int sock, bt_config_t *config)
             process_get(chunkf, outf, config, sock);
         }
     }
+}
+
+void resend(int sock, bt_config_t *config)
+{
+    send_WHOHAS_request(g_chunkfile, sock, config);
+    receive_IHAVE_pack(sock); // change g_chunk state;
 }
 
 void peer_run(bt_config_t *config)
@@ -761,11 +768,43 @@ void peer_run(bt_config_t *config)
 
     while (1)
     {
+        clock_t now = clock();
         int nfds;
         FD_SET(STDIN_FILENO, &readfds);
         FD_SET(sock, &readfds);
 
-        nfds = select(sock + 1, &readfds, NULL, NULL, NULL);
+        struct timeval time;
+        time.tv_sec = 0;
+        time.tv_usec = 0;
+        nfds = select(sock + 1, &readfds, NULL, NULL, &time);
+
+        for (int i = 0; i < max_connected; i++)
+        {
+            // check timer and retransmit
+            if (g_connection[i].state == 1 && g_connection[i].type == 1 && ((now - g_connection[i].timer) / CLOCKS_PER_SEC > 2 * RTT))
+            {
+                send_data_pack(sock, &g_connection[i]);
+            }
+            // collapse and resend whohas;
+            if (g_connection[i].state == 1 && g_connection[i].type == 0 && ((now - g_connection[i].timer) / CLOCKS_PER_SEC > COLLAPSE_TIME))
+            {
+                g_connection[i].state == 0;
+                g_connected--;
+                for (int j = 0; i < g_chunkNum; i++)
+                {
+                    char connection_hash[2 * SHA1_HASH_SIZE + 1];
+                    char chunk_hash[2 * SHA1_HASH_SIZE + 1];
+                    hex2ascii(g_connection[i].chunk, SHA1_HASH_SIZE, connection_hash);
+                    hex2ascii(g_chunks[j].chunk, SHA1_HASH_SIZE, chunk_hash);
+                    if (strcmp(connection_hash, chunk_hash) == 0)
+                    {
+                        g_chunks[j].completed = 0;
+                    }
+                }
+                resend(sock, config);
+                build_new_connection(sock);
+            }
+        }
 
         if (nfds > 0)
         {
