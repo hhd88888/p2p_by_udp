@@ -24,16 +24,6 @@ typedef struct data_packet_s
     char data[1400];
 } ack_packet_t, data_packet_t;
 
-// typedef struct ack_pack_s
-// {
-//     data_body_t data;
-// } ack_packet_t;
-
-// typedef struct data_pack_s
-// {
-//     data_body data;
-// } data_packet_t;
-
 typedef struct WHOHAS_pack_s
 {
     header_t header;
@@ -41,16 +31,6 @@ typedef struct WHOHAS_pack_s
     char padding[3];
     char chunks[74][20];
 } WHOHAS_pack_t, IHAVE_pack_t;
-
-// typedef struct WHOHAS_pack_s
-// {
-//     WHOHAS_body_s_t body;
-// } WHOHAS_pack_t;
-
-// typedef struct IHAVE_pack_s
-// {
-//     WHOHAS_body_s_t body;
-// } IHAVE_pack_t;
 
 typedef struct get_pack_s
 {
